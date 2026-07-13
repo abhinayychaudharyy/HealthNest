@@ -206,8 +206,9 @@ async def google_callback(code: str, db: DBSession):
         google_info = await exchange_code_for_user_info(code)
     except Exception as exc:
         logger.error("[Auth] Google token exchange failed: %s", exc)
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
         return RedirectResponse(
-            url="http://localhost:5173/auth/callback?error=google_auth_failed",
+            url=f"{frontend_url}/auth/callback?error=google_auth_failed",
             status_code=302,
         )
 
@@ -224,8 +225,9 @@ async def google_callback(code: str, db: DBSession):
     logger.info("✅ User %s authenticated successfully via Google.", user.email)
 
     # Redirect browser to frontend with token embedded in URL
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
     return RedirectResponse(
-        url=f"http://localhost:5173/auth/callback?token={token}&user={user_json}",
+        url=f"{frontend_url}/auth/callback?token={token}&user={user_json}",
         status_code=302,
     )
 
