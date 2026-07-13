@@ -132,7 +132,8 @@ app.add_middleware(
         "http://localhost:5173",   # Vite dev server
         "http://localhost:3000",   # fallback CRA / other dev ports
         "http://127.0.0.1:5173",
-        os.getenv("FRONTEND_URL", "http://localhost:5173"), # Production Vercel URL
+        "https://health-nest-murex.vercel.app", # Hardcoded production URL to guarantee CORS passes
+        os.getenv("FRONTEND_URL", "http://localhost:5173"), # Dynamic URL
     ],
     allow_credentials=True,
     allow_methods=["*"],
