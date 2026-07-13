@@ -1,0 +1,29 @@
+/* App.css — all global styles are in index.css */
+/* This file is intentionally minimal */
+
+/* Recharts custom overrides */
+.recharts-surface { overflow: visible; }
+
+.recharts-cartesian-grid line {
+  stroke: rgba(148, 163, 184, 0.08);
+}
+
+.recharts-legend-item-text {
+  color: var(--text-secondary) !important;
+  font-size: 0.8rem;
+}
+
+.recharts-tooltip-wrapper {
+  outline: none !important;
+}
+
+/* Mobile menu button visibility */
+@media (max-width: 768px) {
+  #mobile-menu-btn { display: flex !important; }
+  .topbar-time { display: block !important; }
+}
+
+/* Chat page height fix inside app shell */
+.page-content .animate-fadeIn {
+  animation: fadeIn 0.4s ease both;
+}
