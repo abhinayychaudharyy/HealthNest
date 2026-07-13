@@ -16,7 +16,6 @@ export default function Topbar({ title, subtitle, onMenuToggle }) {
           id="mobile-menu-btn"
           onClick={onMenuToggle}
           className="btn btn-ghost btn-icon"
-          style={{ display: 'none' }}
           aria-label="Toggle menu"
         >
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">

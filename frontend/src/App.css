@@ -17,10 +17,11 @@
   outline: none !important;
 }
 
-/* Mobile menu button visibility */
+/* Mobile menu button: hidden on desktop, visible on mobile */
+#mobile-menu-btn { display: none; }
+
 @media (max-width: 768px) {
   #mobile-menu-btn { display: flex !important; }
-  .topbar-time { display: block !important; }
 }
 
 /* Chat page height fix inside app shell */

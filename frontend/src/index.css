@@ -1179,3 +1179,34 @@ select.input option { background: var(--bg-card); }
   .login-right { display: none; }
   .login-left { padding: 2rem 1.5rem; }
 }
+
+/* ─── Mobile / Responsive Layout ─────────────────────────────────────────── */
+@media (max-width: 768px) {
+  /* Hide sidebar off-screen by default on mobile */
+  .sidebar {
+    transform: translateX(-100%);
+    box-shadow: none;
+    z-index: 200;
+  }
+
+  /* Slide sidebar in when .open is toggled */
+  .sidebar.open {
+    transform: translateX(0);
+    box-shadow: var(--shadow-xl);
+  }
+
+  /* Main content takes full width on mobile (no sidebar margin) */
+  .main-content {
+    margin-left: 0;
+  }
+
+  /* Shrink topbar padding on mobile */
+  .topbar {
+    padding: 0 1rem;
+  }
+
+  /* Shrink page content padding on mobile */
+  .page-content {
+    padding: 1rem;
+  }
+}
