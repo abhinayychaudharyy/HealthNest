@@ -665,7 +665,9 @@ async def analyze_document_vision(images_base64: list[str]) -> str:
         len(pages_to_process), total_pages
     )
 
-    for page_num, b64_img in enumerate(pages_to_process, start=1):
+    import asyncio
+
+    async def process_page(page_num: int, b64_img: str) -> str:
         try:
             page_prompt = VISION_ANALYSIS_PROMPT
             if total_pages > 1:
@@ -677,13 +679,15 @@ async def analyze_document_vision(images_base64: list[str]) -> str:
             ]
             messages = [HumanMessage(content=content)]
             page_text = await (vision_llm | StrOutputParser()).ainvoke(messages)
-            page_summaries.append(
-                f"--- Page {page_num} ---\n{page_text.strip()}"
-            )
             _logger.info("[Vision Analyzer] Page %d analyzed (%d chars).", page_num, len(page_text))
+            return f"--- Page {page_num} ---\n{page_text.strip()}"
         except Exception as exc:
             _logger.warning("[Vision Analyzer] Page %d failed: %s", page_num, exc)
-            page_summaries.append(f"--- Page {page_num} --- [Analysis failed: {exc}]")
+            return f"--- Page {page_num} --- [Analysis failed: {exc}]"
+
+    # Run all page analysis tasks in parallel!
+    tasks = [process_page(num, img) for num, img in enumerate(pages_to_process, start=1)]
+    page_summaries = await asyncio.gather(*tasks)
 
     if not page_summaries:
         return "⚠️ Document analysis failed — no pages could be processed."

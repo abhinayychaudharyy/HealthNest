@@ -10,6 +10,8 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     # ── Database ──────────────────────────────────────────────────────────
     DATABASE_URL: str = "postgresql://postgres:root@123@localhost:5432/healthcare_ai_db"
+    SUPABASE_URL: str = ""
+    SUPABASE_PUBLIC_API_KEY: str = ""
 
     # =========================================================================
     # Google OAuth2 (get credentials at https://console.cloud.google.com/)

@@ -13,6 +13,7 @@ Authentication flow:
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Annotated, Optional
 
@@ -131,6 +132,7 @@ app.add_middleware(
         "http://localhost:5173",   # Vite dev server
         "http://localhost:3000",   # fallback CRA / other dev ports
         "http://127.0.0.1:5173",
+        os.getenv("FRONTEND_URL", "http://localhost:5173"), # Production Vercel URL
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -1518,12 +1520,36 @@ async def upload_report(
         logger.info("[Reports] Using Text Model for analysis.")
         ai_summary = await analyze_report_text(raw_text, patient_name=patient.name)
 
+    # Upload to Supabase Storage
+    public_url = filepath
+    if settings.SUPABASE_URL and settings.SUPABASE_PUBLIC_API_KEY:
+        try:
+            from supabase import create_client, Client
+            supabase_client: Client = create_client(settings.SUPABASE_URL, settings.SUPABASE_PUBLIC_API_KEY)
+            
+            storage_path = f"{current_user.id}/{safe_filename}"
+            supabase_client.storage.from_("reports").upload(
+                path=storage_path,
+                file=file_content,
+                file_options={"content-type": file.content_type}
+            )
+            
+            public_url = supabase_client.storage.from_("reports").get_public_url(storage_path)
+            logger.info("[Reports] Uploaded to Supabase Storage: %s", public_url)
+            
+            # Clean up local file
+            if os.path.exists(filepath):
+                os.remove(filepath)
+                logger.info("[Reports] Cleaned up local temporary file.")
+        except Exception as exc:
+            logger.error("[Reports] Failed to upload to Supabase: %s", exc)
+
     # Save to database
     report = MedicalReport(
         user_id=current_user.id,
         patient_id=patient_id,
         filename=file.filename,
-        filepath=filepath,
+        filepath=public_url,
         file_size_kb=file_size_kb,
         ai_summary=ai_summary,
     )
