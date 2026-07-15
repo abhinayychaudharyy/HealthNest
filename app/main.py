@@ -1474,7 +1474,6 @@ async def upload_report(
             logger.info("[Reports] Extracted %d chars from PDF (PyMuPDF).", len(raw_text))
         except ImportError:
             try:
-                import io
                 import pypdf
                 with open(filepath, "rb") as f:
                     reader = pypdf.PdfReader(f)
@@ -1486,8 +1485,22 @@ async def upload_report(
         except Exception as exc:
             logger.error("[Reports] PDF text extraction failed: %s", exc)
 
-    # Try to ingest into vector store for future RAG queries (only if PDF and has text)
-    if ext == 'pdf' and len(raw_text.strip()) > 50:
+    # Determine if extracted text is meaningful (not garbage OCR or too short)
+    # A quality text PDF should have >200 chars AND >40% of tokens being real words (alpha chars)
+    def _is_readable_text(text: str) -> bool:
+        stripped = text.strip()
+        if len(stripped) < 200:
+            return False
+        words = stripped.split()
+        if not words:
+            return False
+        alpha_words = sum(1 for w in words if any(c.isalpha() for c in w))
+        return (alpha_words / len(words)) >= 0.40
+
+    is_text_pdf = ext == 'pdf' and _is_readable_text(raw_text)
+
+    # Try to ingest into vector store for future RAG queries (only if PDF has readable text)
+    if is_text_pdf:
         try:
             from app.vector_store import ingest_pdf_documents
             ingest_pdf_documents([filepath])
@@ -1497,30 +1510,36 @@ async def upload_report(
 
     # AI Report Analysis
     ai_summary = ""
-    if ext in ['png', 'jpg', 'jpeg'] or (ext == 'pdf' and len(raw_text.strip()) < 50):
-        # Use vision model for images or scanned PDFs
+    if ext in ['png', 'jpg', 'jpeg'] or not is_text_pdf:
+        # Use vision model for standalone images OR scanned/image-based PDFs
         from app.graph import analyze_document_vision
         import base64
         images_base64 = []
         if ext == 'pdf':
             try:
                 import fitz
+                # Use 1.5x matrix (~108 DPI) — good quality but keeps JPEG small enough
+                # for NVIDIA API payload limits (< 180 KB per image)
+                render_matrix = fitz.Matrix(1.5, 1.5)
                 with fitz.open(filepath) as doc:
                     for page in doc:
-                        pix = page.get_pixmap()
+                        pix = page.get_pixmap(matrix=render_matrix)
                         img_bytes = pix.tobytes("jpeg")
                         images_base64.append(base64.b64encode(img_bytes).decode('utf-8'))
+                logger.info("[Reports] Rendered %d PDF page(s) for vision analysis.", len(images_base64))
             except Exception as e:
-                logger.error("Failed to convert PDF to image for vision analysis: %s", e)
+                logger.error("[Reports] Failed to convert PDF to images for vision analysis: %s", e)
+                ai_summary = f"⚠️ Could not render PDF pages for analysis: {e}"
         else:
             with open(filepath, "rb") as img_f:
                 images_base64.append(base64.b64encode(img_f.read()).decode('utf-8'))
-        
-        logger.info("[Reports] Using Vision Model for analysis.")
-        ai_summary = await analyze_document_vision(images_base64)
+
+        if images_base64:
+            logger.info("[Reports] Using Vision Model for analysis (%d image(s)).", len(images_base64))
+            ai_summary = await analyze_document_vision(images_base64)
     else:
-        # Use text model for text-heavy PDFs
-        logger.info("[Reports] Using Text Model for analysis.")
+        # Use text model for readable text PDFs
+        logger.info("[Reports] Using Text Model for analysis (%d chars).", len(raw_text))
         ai_summary = await analyze_report_text(raw_text, patient_name=patient.name)
 
     # Upload to Supabase Storage
@@ -1602,21 +1621,51 @@ async def reanalyze_report(
         raise HTTPException(status_code=403, detail="Access denied.")
 
     ext = report.filename.lower().split('.')[-1]
-    
+
+    # ── Fetch file content ─────────────────────────────────────────────────
+    # report.filepath may be a Supabase public URL (https://...) or a local path.
+    # We need the raw bytes for both text extraction and image rendering.
+    file_bytes: bytes = b""
+    is_url = report.filepath.startswith("http://") or report.filepath.startswith("https://")
+
+    if is_url:
+        # Download from Supabase (or any public URL)
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(report.filepath)
+                resp.raise_for_status()
+                file_bytes = resp.content
+            logger.info("[Reports] Downloaded %d bytes from URL for re-analysis.", len(file_bytes))
+        except Exception as exc:
+            logger.error("[Reports] Failed to download file from URL: %s", exc)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not download report file for re-analysis: {exc}"
+            )
+    else:
+        # Local file
+        if not os.path.exists(report.filepath):
+            raise HTTPException(status_code=404, detail="Report file not found on disk.")
+        with open(report.filepath, "rb") as f:
+            file_bytes = f.read()
+
+    # ── Extract text from PDF bytes ────────────────────────────────────────
     raw_text = ""
     if ext == 'pdf':
         try:
             import fitz  # PyMuPDF
-            with fitz.open(report.filepath) as doc:
+            with fitz.open(stream=file_bytes, filetype="pdf") as doc:
                 for page in doc:
                     raw_text += page.get_text() or ""
+            logger.info("[Reports] Re-extracted %d chars from PDF.", len(raw_text))
         except ImportError:
             try:
+                import io
                 import pypdf
-                with open(report.filepath, "rb") as f:
-                    reader = pypdf.PdfReader(f)
-                    for page in reader.pages:
-                        raw_text += page.extract_text() or ""
+                reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+                for page in reader.pages:
+                    raw_text += page.extract_text() or ""
             except Exception as exc:
                 raw_text = f"Re-extraction failed: {exc}"
         except Exception as exc:
@@ -1628,8 +1677,21 @@ async def reanalyze_report(
         if p:
             patient_name = p.name
 
+    # ── Same readability heuristic as upload ──────────────────────────────
+    def _is_readable_text(text: str) -> bool:
+        stripped = text.strip()
+        if len(stripped) < 200:
+            return False
+        words = stripped.split()
+        if not words:
+            return False
+        alpha_words = sum(1 for w in words if any(c.isalpha() for c in w))
+        return (alpha_words / len(words)) >= 0.40
+
+    is_text_pdf = ext == 'pdf' and _is_readable_text(raw_text)
+
     ai_summary = ""
-    if ext in ['png', 'jpg', 'jpeg'] or (ext == 'pdf' and len(raw_text.strip()) < 50):
+    if ext in ['png', 'jpg', 'jpeg'] or not is_text_pdf:
         # Use vision model
         from app.graph import analyze_document_vision
         import base64
@@ -1637,22 +1699,26 @@ async def reanalyze_report(
         if ext == 'pdf':
             try:
                 import fitz
-                with fitz.open(report.filepath) as doc:
+                render_matrix = fitz.Matrix(1.5, 1.5)  # ~108 DPI — smaller images
+                with fitz.open(stream=file_bytes, filetype="pdf") as doc:
                     for page in doc:
-                        pix = page.get_pixmap()
+                        pix = page.get_pixmap(matrix=render_matrix)
                         img_bytes = pix.tobytes("jpeg")
                         images_base64.append(base64.b64encode(img_bytes).decode('utf-8'))
+                logger.info("[Reports] Rendered %d PDF page(s) for re-analysis.", len(images_base64))
             except Exception as e:
-                logger.error("Failed to convert PDF to image for vision analysis: %s", e)
+                logger.error("[Reports] Failed to convert PDF to images for re-analysis: %s", e)
         else:
-            with open(report.filepath, "rb") as img_f:
-                images_base64.append(base64.b64encode(img_f.read()).decode('utf-8'))
-        
-        logger.info("[Reports] Re-analyzing using Vision Model.")
-        ai_summary = await analyze_document_vision(images_base64)
+            images_base64.append(base64.b64encode(file_bytes).decode('utf-8'))
+
+        if images_base64:
+            logger.info("[Reports] Re-analyzing using Vision Model (%d page(s)).", len(images_base64))
+            ai_summary = await analyze_document_vision(images_base64)
+        else:
+            ai_summary = "⚠️ Could not extract page images from this PDF for re-analysis."
     else:
-        # Use text model
-        logger.info("[Reports] Re-analyzing using Text Model.")
+        # Use text model for readable text PDFs
+        logger.info("[Reports] Re-analyzing using Text Model (%d chars).", len(raw_text))
         ai_summary = await analyze_report_text(raw_text, patient_name=patient_name)
 
     report.ai_summary = ai_summary

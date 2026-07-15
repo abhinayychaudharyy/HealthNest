@@ -58,3 +58,7 @@ python-dotenv>=1.0.1
 # ── Utilities ─────────────────────────────────────────────────────────────────
 httpx>=0.27.0
 twilio>=8.4.0
+
+# ── PDF & Image Processing ────────────────────────────────────────────────
+pymupdf>=1.24.0              # PyMuPDF (fitz) — PDF to image rendering
+Pillow>=10.0.0               # Image compression (resize + JPEG quality) for vision API

@@ -628,25 +628,150 @@ Do NOT diagnose or prescribe. Be factual and clear.
 """
 
 
+async def _compress_image_b64(b64_img: str, max_width: int = 800, quality: int = 60) -> str:
+    """
+    Resizes and recompresses a base64 JPEG image to fit within NVIDIA API
+    payload limits (~180 KB). Returns compressed base64 string.
+    Falls back to original if Pillow is unavailable.
+    """
+    import base64
+    import io
+    try:
+        from PIL import Image
+        img_bytes = base64.b64decode(b64_img)
+        img = Image.open(io.BytesIO(img_bytes))
+        # Convert to RGB (avoids issues with palette/RGBA modes)
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        # Resize if wider than max_width
+        if img.width > max_width:
+            ratio = max_width / img.width
+            new_size = (max_width, int(img.height * ratio))
+            img = img.resize(new_size, Image.LANCZOS)
+        # Re-encode as JPEG at lower quality
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        # If Pillow is unavailable, return original (may exceed limit)
+        return b64_img
+
+
+async def _analyze_page_nvidia(
+    vision_llm,
+    page_num: int,
+    b64_img: str,
+    total_pages: int,
+    prompt: str,
+    _logger,
+    max_retries: int = 2,
+) -> str:
+    """
+    Analyze a single page image using NVIDIA vision model.
+    Retries up to max_retries times on failure.
+    """
+    import asyncio
+    compressed = await _compress_image_b64(b64_img)
+
+    page_prompt = prompt
+    if total_pages > 1:
+        page_prompt += f"\n\nNote: This is page {page_num} of {total_pages} total pages."
+
+    content = [
+        {"type": "text", "text": page_prompt},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{compressed}"}},
+    ]
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            from langchain_core.messages import HumanMessage
+            from langchain_core.output_parsers import StrOutputParser
+            messages = [HumanMessage(content=content)]
+            page_text = await (vision_llm | StrOutputParser()).ainvoke(messages)
+            _logger.info(
+                "[Vision Analyzer] NVIDIA: Page %d analyzed OK (%d chars, attempt %d).",
+                page_num, len(page_text), attempt,
+            )
+            return page_text.strip()
+        except Exception as exc:
+            last_err = exc
+            _logger.warning(
+                "[Vision Analyzer] NVIDIA: Page %d attempt %d failed: %s",
+                page_num, attempt, exc,
+            )
+            if attempt < max_retries:
+                await asyncio.sleep(1.5 * attempt)  # back-off before retry
+
+    return f"[NVIDIA analysis failed after {max_retries} attempts: {last_err}]"
+
+
+async def _analyze_page_groq_vision(
+    page_num: int,
+    b64_img: str,
+    total_pages: int,
+    prompt: str,
+    _logger,
+) -> str:
+    """
+    Fallback: analyze a single page using Groq's vision-capable model
+    (meta-llama/llama-4-scout-17b-16e-instruct). Used when NVIDIA fails.
+    """
+    try:
+        from langchain_groq import ChatGroq
+        from langchain_core.messages import HumanMessage
+        from langchain_core.output_parsers import StrOutputParser
+        import asyncio
+
+        groq_vision = ChatGroq(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            api_key=settings.GROQ_API_KEY,
+            temperature=0.1,
+            max_tokens=2048,
+        )
+
+        compressed = await _compress_image_b64(b64_img)
+        page_prompt = prompt
+        if total_pages > 1:
+            page_prompt += f"\n\nNote: This is page {page_num} of {total_pages} total pages."
+
+        content = [
+            {"type": "text", "text": page_prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{compressed}"}},
+        ]
+        messages = [HumanMessage(content=content)]
+        result = await (groq_vision | StrOutputParser()).ainvoke(messages)
+        _logger.info(
+            "[Vision Analyzer] Groq fallback: Page %d analyzed OK (%d chars).",
+            page_num, len(result),
+        )
+        return result.strip()
+    except Exception as exc:
+        _logger.error("[Vision Analyzer] Groq fallback also failed for page %d: %s", page_num, exc)
+        return f"[Both NVIDIA and Groq vision analysis failed for this page: {exc}]"
+
+
 async def analyze_document_vision(images_base64: list[str]) -> str:
     """
     Takes a list of base64 encoded images (e.g. PDF pages or raw images)
     and returns a structured clinical summary using a multimodal vision model.
-    
-    Processes ONE image at a time (NVIDIA API limit: 1 image per request).
-    For multi-page PDFs, analyzes each page separately and merges results.
+
+    Strategy:
+    - Images are compressed to ≤800px / JPEG 60% to stay within NVIDIA's payload limit.
+    - Pages are processed SEQUENTIALLY (not in parallel) to avoid NVIDIA rate limits.
+    - Each page is retried up to 2x on failure before falling back to Groq vision.
+    - Processes up to 8 pages; longer reports get a truncation note.
     """
+    import asyncio
     import logging
-    from langchain_core.messages import HumanMessage
     from langchain_nvidia_ai_endpoints import ChatNVIDIA
-    from langchain_core.output_parsers import StrOutputParser
 
     _logger = logging.getLogger(__name__)
 
     if not images_base64:
         return "⚠️ No images provided for analysis."
 
-    # Use NVIDIA's hosted Llama 3.2 Vision model
+    # NVIDIA vision LLM (primary)
     vision_llm = ChatNVIDIA(
         model="meta/llama-3.2-90b-vision-instruct",
         api_key=settings.NVIDIA_API_KEY,
@@ -654,53 +779,60 @@ async def analyze_document_vision(images_base64: list[str]) -> str:
         max_tokens=2048,
     )
 
-    # NVIDIA API only allows 1 image per request — process pages one at a time
-    # Limit to first 5 pages to avoid excessive API calls
-    pages_to_process = images_base64[:5]
+    # Limit pages to avoid excessive API calls; 8 pages for longer reports
+    MAX_PAGES = 8
+    pages_to_process = images_base64[:MAX_PAGES]
     total_pages = len(images_base64)
-    page_summaries = []
 
     _logger.info(
-        "[Vision Analyzer] Processing %d of %d page(s) one at a time.",
-        len(pages_to_process), total_pages
+        "[Vision Analyzer] Starting sequential analysis of %d/%d page(s).",
+        len(pages_to_process), total_pages,
     )
 
-    import asyncio
+    page_summaries: list[str] = []
 
-    async def process_page(page_num: int, b64_img: str) -> str:
-        try:
-            page_prompt = VISION_ANALYSIS_PROMPT
-            if total_pages > 1:
-                page_prompt += f"\n\nNote: This is page {page_num} of {total_pages} total pages."
+    # Process pages SEQUENTIALLY to respect NVIDIA rate limits
+    for idx, b64_img in enumerate(pages_to_process, start=1):
+        _logger.info("[Vision Analyzer] Processing page %d/%d ...", idx, len(pages_to_process))
 
-            content = [
-                {"type": "text", "text": page_prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}},
-            ]
-            messages = [HumanMessage(content=content)]
-            page_text = await (vision_llm | StrOutputParser()).ainvoke(messages)
-            _logger.info("[Vision Analyzer] Page %d analyzed (%d chars).", page_num, len(page_text))
-            return f"--- Page {page_num} ---\n{page_text.strip()}"
-        except Exception as exc:
-            _logger.warning("[Vision Analyzer] Page %d failed: %s", page_num, exc)
-            return f"--- Page {page_num} --- [Analysis failed: {exc}]"
+        page_text = await _analyze_page_nvidia(
+            vision_llm=vision_llm,
+            page_num=idx,
+            b64_img=b64_img,
+            total_pages=total_pages,
+            prompt=VISION_ANALYSIS_PROMPT,
+            _logger=_logger,
+            max_retries=2,
+        )
 
-    # Run all page analysis tasks in parallel!
-    tasks = [process_page(num, img) for num, img in enumerate(pages_to_process, start=1)]
-    page_summaries = await asyncio.gather(*tasks)
+        # If NVIDIA failed (indicated by our error sentinel), try Groq fallback
+        if page_text.startswith("[NVIDIA analysis failed"):
+            _logger.info("[Vision Analyzer] Trying Groq fallback for page %d.", idx)
+            page_text = await _analyze_page_groq_vision(
+                page_num=idx,
+                b64_img=b64_img,
+                total_pages=total_pages,
+                prompt=VISION_ANALYSIS_PROMPT,
+                _logger=_logger,
+            )
+
+        label = f"--- Page {idx} ---\n" if len(pages_to_process) > 1 else ""
+        page_summaries.append(f"{label}{page_text}")
+
+        # Small delay between pages to avoid hitting rate limits
+        if idx < len(pages_to_process):
+            await asyncio.sleep(0.5)
 
     if not page_summaries:
         return "⚠️ Document analysis failed — no pages could be processed."
 
-    # If single page, return directly; if multi-page, merge
+    # Assemble final summary
     if len(page_summaries) == 1:
-        summary = page_summaries[0].replace("--- Page 1 ---\n", "").strip()
+        summary = page_summaries[0].strip()
     else:
-        # Combine all page summaries
-        combined = "\n\n".join(page_summaries)
-        if total_pages > 5:
-            combined += f"\n\n[Note: Only first 5 of {total_pages} pages were analyzed.]"
-        summary = combined
+        summary = "\n\n".join(page_summaries)
+        if total_pages > MAX_PAGES:
+            summary += f"\n\n[Note: Only first {MAX_PAGES} of {total_pages} pages were analyzed.]"
 
     _logger.info("[Vision Analyzer] Final summary ready (%d chars).", len(summary))
     return summary
